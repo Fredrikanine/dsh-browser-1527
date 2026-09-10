@@ -16,19 +16,17 @@
  * @module @yuxianglin/dsh-bridge-browser
  */
 
-import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-attachment'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-tools'
-import type {} from '@deepseek-ai/dsh-host-apiproxy'
+import type {} from './typert-types.ts'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
-import type { ApiProxy } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { toFetchHandler } from '@deepseek-ai/dsh-host-apiproxy'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { BridgeServer } from './server.ts'
+import { BridgeEventFeed } from './events.ts'
+import { createLegacyInvoker } from './gateway.ts'
 import { BrowserContextInjector } from './browser-context.ts'
 import { registerBrowserTools } from './tools.ts'
 import {
@@ -37,8 +35,6 @@ import {
   DEFAULT_SNAPSHOT_MAX_CHARS,
   MIN_SNAPSHOT_MAX_CHARS,
 } from './protocol.ts'
-import { withSessionDeferral } from './session-deferral.ts'
-import { withSessionWorkspace } from './session-workspace.ts'
 import { purgeSessionFiles, type SessionPurgeDeps } from './session-purge.ts'
 import { resolveToken } from './token.ts'
 
@@ -46,7 +42,7 @@ import { resolveToken } from './token.ts'
 export const name = 'bridge-browser'
 
 /** Services required by this plugin. */
-export const inject = ['webServer', 'apiProxy', 'tools', 'agents']
+export const inject = ['webServer', 'typertGateway', 'tools', 'agents']
 
 /** Default per-tool-call budget (ms). */
 const DEFAULT_TOOL_TIMEOUT_MS = 90_000
@@ -132,27 +128,31 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const resolved = resolveConfig(config)
 
   const tokenRes = await resolveToken(resolved.token)
-  // Workspace grouping wraps the gateway create; session deferral wraps the
-  // result so materialization at first prompt still flows through grouping.
-  const api: ApiProxy = withSessionDeferral(
-    withSessionWorkspace(
-      ctx.apiProxy,
-      resolved.sessionWorkspacePath,
-      message => { ctx.logger.warn(message) },
-    ),
-    resolved.deferSessionCreate,
-    ctx.get('attachments')?.imageLimits,
-  )
   const browserContext = new BrowserContextInjector(ctx.agents)
   ctx.on('agent/session-start', ({ agent }) => { browserContext.activate(agent) })
+
+  // One active connection at a time: the invoker routes session observation
+  // to the feed of the currently promoted extension socket.
+  let activeFeed: BridgeEventFeed | null = null
+  const attachments = ctx.get('attachments')
+  const invokeRpc = createLegacyInvoker(ctx, {
+    deferSessionCreate: resolved.deferSessionCreate,
+    sessionWorkspacePath: resolved.sessionWorkspacePath,
+    ...(attachments?.imageLimits === undefined ? {} : { imageLimits: attachments.imageLimits }),
+    warn: message => { ctx.logger.warn(message) },
+    observeSession: (sessionId) => { activeFeed?.noteSession(sessionId) },
+    workspaceBaseline: () => activeFeed === null
+      ? { items: [], archivedSessionIds: [] }
+      : activeFeed.workspaceBaseline(),
+  })
 
   const purgeSession = async (sessionId: string): Promise<void> => {
     const runningSessionIds = new Set<string>()
     try {
-      const listed = await api.sessions.list({ rpcId: RpcId(randomUUID()), payload: {} })
-      if (listed.result.ok) {
-        for (const entry of listed.result.value.items) {
-          if (entry.running) runningSessionIds.add(entry.sessionId)
+      const listed = await invokeRpc('session.list', {})
+      if (listed.ok) {
+        for (const entry of (listed.value as { items?: Array<{ running?: boolean; sessionId?: string }> }).items ?? []) {
+          if (entry.running === true && typeof entry.sessionId === 'string') runningSessionIds.add(entry.sessionId)
         }
       }
     } catch {
@@ -165,8 +165,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   const server = new BridgeServer({
     token: tokenRes.token,
-    apiHandler: toFetchHandler(api),
-    openEvents: (signal) => api.events.mux({ rpcId: RpcId(randomUUID()), payload: {} }, signal),
+    invokeRpc,
+    createEventFeed: (sink, onError) => {
+      const feed = new BridgeEventFeed(ctx.typertGateway, sink, onError)
+      activeFeed = feed
+      return feed
+    },
     toolTimeoutMs: resolved.toolTimeoutMs,
     caps: {
       textOnly: true,
