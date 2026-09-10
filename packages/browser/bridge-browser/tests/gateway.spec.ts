@@ -193,10 +193,21 @@ describe('session deferral', () => {
 
     const prompted = await call('session.prompt', { sessionId: provisional, mode: 'queue', content: [{ type: 'text', text: 'hi' }] })
     expect(prompted).toEqual({ ok: true, value: { accepted: true } })
-    expect(gateway.calls).toEqual([
+    expect(gateway.calls).toHaveLength(2)
+    expect(gateway.calls[0]).toEqual(
       { namespace: 'session', method: 'create', args: { request: { cwd: 'C:/work', sessionId: provisional } } },
-      { namespace: 'session', method: 'prompt', args: { request: { sessionId: provisional, mode: 'queue', content: [{ type: 'text', text: 'hi' }] } } },
-    ])
+    )
+    // 0.1.5 requires a client-minted `requestId` the frozen extension protocol
+    // never carried; the bridge supplies one and preserves every other field.
+    const promptCall = gateway.calls.find((entry) => entry.method === 'prompt')
+    if (promptCall === undefined) throw new Error('prompt call was not recorded')
+    const promptRequest = promptCall.args.request as Record<string, unknown>
+    expect(promptRequest).toMatchObject({
+      sessionId: provisional,
+      mode: 'queue',
+      content: [{ type: 'text', text: 'hi' }],
+    })
+    expect(promptRequest.requestId).toMatch(/^[0-9a-f-]{36}$/)
 
     // After materialization the history passthrough reaches the gateway.
     const after = await call('session.history', { sessionId: provisional })
@@ -224,6 +235,19 @@ describe('session deferral', () => {
     const result = await call('session.create', {})
     expect(okValue(result)).toEqual({ sessionId: 'session-direct' })
     expect(gateway.calls.length).toBe(1)
+  })
+
+  it('mints a fresh requestId per prompt and honours a caller-supplied one', async () => {
+    const gateway = recordingGateway([{ accepted: true }, { accepted: true }])
+    const call = invoker(gateway)
+
+    await call('session.prompt', { sessionId: 's1', mode: 'queue', content: [{ type: 'text', text: 'a' }], requestId: 'caller-id' })
+    await call('session.prompt', { sessionId: 's1', mode: 'queue', content: [{ type: 'text', text: 'b' }] })
+
+    const ids = gateway.calls.map((entry) => (entry.args.request as { requestId?: unknown }).requestId)
+    expect(ids[0]).toBe('caller-id')
+    expect(typeof ids[1]).toBe('string')
+    expect(ids[1]).not.toBe('caller-id')
   })
 })
 

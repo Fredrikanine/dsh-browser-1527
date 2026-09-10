@@ -128,7 +128,12 @@ export function createLegacyInvoker(
     const materialized = await deferral.prompt(sessionId, (request) =>
       invoke('session', 'create', { request }, signal))
     if (materialized !== null) return materialized
-    const result = await invoke('session', 'prompt', { request: payload }, signal)
+    // 0.1.5 made `requestId` a required wire field on session/prompt: the
+    // client-minted identity persisted on the accepted user message. The
+    // frozen extension protocol predates it, so the bridge mints one per call
+    // unless the caller already supplied one.
+    const request = { ...payload, requestId: requestIdOf(payload) }
+    const result = await invoke('session', 'prompt', { request }, signal)
     if (result.ok && sessionId !== '') options.observeSession(sessionId)
     return result
   }
@@ -316,6 +321,17 @@ function createWorkspaceGrouping(
       return { workspaces: baseline.items, archivedSessionIds: baseline.archivedSessionIds }
     },
   }
+}
+
+/**
+ * Identity of the accepted user message, required by the 0.1.5
+ * `session/prompt` wire contract. The frozen extension protocol carries no
+ * such field, so the bridge mints one; an explicit caller value wins so a
+ * future protocol revision can own the identity itself.
+ */
+function requestIdOf(payload: Record<string, unknown>): string {
+  const supplied = payload.requestId
+  return typeof supplied === 'string' && supplied !== '' ? supplied : randomUUID()
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
