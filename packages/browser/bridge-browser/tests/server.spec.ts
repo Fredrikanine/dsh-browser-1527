@@ -2,9 +2,10 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
-import type { MuxFrame, RpcRequest } from '@deepseek-ai/dsh-host-apiproxy/api'
-import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api'
 import { BridgeServer, BridgeToolError, isLoopbackAddress, messageToText, payloadCode, payloadMessage } from '../src/server.ts'
+import { BridgeEventFeed } from '../src/events.ts'
+import type { LegacyResult } from '../src/gateway.ts'
+import type { TypertGatewayLike } from '../src/typert-types.ts'
 import { BRIDGE_INJECT_BROWSER_SNAPSHOT_METHOD, BRIDGE_SESSION_PURGE_METHOD, type BridgeFrame } from '../src/protocol.ts'
 import { SessionPurgeError } from '../src/session-purge.ts'
 
@@ -17,28 +18,66 @@ const FIREFOX_EXT_ORIGIN = 'moz-extension://per-install-uuid'
 /** Extension caps used by every hello in this suite. */
 const CAPS = { textOnly: true as const, snapshotMaxChars: 12_000, maxInteractiveItems: 60 }
 
+/** One controllable stream keyed by endpoint in the fake gateway. */
+type StreamFactory = (signal: AbortSignal) => AsyncIterable<unknown>
+
+function emptyStream(): AsyncIterable<unknown> {
+  return { async *[Symbol.asyncIterator]() {} }
+}
+
+interface FakeGateway extends TypertGatewayLike {
+  dispatchRpc: ReturnType<typeof vi.fn>
+  streams: Map<string, StreamFactory>
+}
+
+/** Test gateway over the structural Typert seam. */
+function fakeGateway(streams: Record<string, StreamFactory> = {}): FakeGateway {
+  const dispatchRpc = vi.fn(async () => ({ ok: true }))
+  return {
+    invoke: vi.fn(async ({ namespace, method }: { namespace: string; method: string }) => {
+      if (namespace === 'session' && method === 'list') return { items: [] }
+      return { accepted: true }
+    }),
+    stream: vi.fn(async () => emptyStream()),
+    dispatchRpc,
+    streams: new Map(Object.entries(streams)),
+    wireStream: {
+      open: vi.fn(async (endpoint: string, _payload: unknown, signal: AbortSignal) => {
+        const factory = streams[endpoint]
+        return factory === undefined ? emptyStream() : factory(signal)
+      }),
+      failure: (error: unknown) => {
+        const candidate = error as { isDSHRemoteError?: boolean; code?: string; message?: string; details?: unknown }
+        if (candidate !== null && typeof candidate === 'object' && candidate.isDSHRemoteError === true && typeof candidate.code === 'string') {
+          return { code: candidate.code, message: candidate.message ?? '', details: (candidate.details ?? {}) as object }
+        }
+        return {
+          code: 'gateway/internal',
+          message: error instanceof Error ? error.message : String(error),
+          details: {},
+        }
+      },
+    },
+  }
+}
+
 interface Harness {
   bridge: BridgeServer
   server: Server
   url: string
-  fetchMock: ReturnType<typeof vi.fn>
+  invokeRpc: ReturnType<typeof vi.fn>
+  gateway: FakeGateway
 }
 
-async function startBridge(overrides: Partial<ConstructorParameters<typeof BridgeServer>[0]> = {}): Promise<Harness> {
-  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ type: 'server-response', rpcId: 'r', result: { ok: true, value: 'ok' } }), {
-    status: 200,
-    headers: { 'content-type': 'application/json' },
-  }))
-  const events: AsyncIterable<RpcRequest<MuxFrame>> = {
-    async *[Symbol.asyncIterator]() {
-      yield { rpcId: RpcId('e1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
-      yield { rpcId: RpcId('e2'), payload: { type: 'session/queue', sessionId: 's1' as never, items: [] } }
-    },
-  }
+async function startBridge(
+  overrides: Partial<ConstructorParameters<typeof BridgeServer>[0]> & { gateway?: FakeGateway } = {},
+): Promise<Harness> {
+  const invokeRpc = vi.fn(async (): Promise<LegacyResult> => ({ ok: true, value: 'ok' }))
+  const gateway = overrides.gateway ?? fakeGateway()
   const bridge = new BridgeServer({
     token: TOKEN,
-    apiHandler: { fetch: fetchMock },
-    openEvents: () => events,
+    invokeRpc: invokeRpc as unknown as ConstructorParameters<typeof BridgeServer>[0]['invokeRpc'],
+    createEventFeed: (sink, onError) => new BridgeEventFeed(gateway, sink, onError),
     toolTimeoutMs: 1_000,
     caps: { textOnly: true, snapshotMaxChars: 12_000, maxInteractiveItems: 60 },
     injectBrowserSnapshot: vi.fn(),
@@ -49,7 +88,7 @@ async function startBridge(overrides: Partial<ConstructorParameters<typeof Bridg
   server.on('upgrade', (req, socket, head) => { bridge.handleUpgrade(req, socket, head) })
   await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve) })
   const port = (server.address() as AddressInfo).port
-  return { bridge, server, url: `ws://127.0.0.1:${port}/ext/bridge`, fetchMock }
+  return { bridge, server, url: `ws://127.0.0.1:${port}/ext/bridge`, invokeRpc, gateway }
 }
 
 function connect(url: string, origin?: string): Promise<{ ws: WebSocket; frames: BridgeFrame[]; done: Promise<void> }> {
@@ -191,7 +230,7 @@ describe('BridgeServer', () => {
     expect(ws.readyState).toBe(WebSocket.CLOSED)
   })
 
-  it('passes rpc frames to the gateway handler and relays the envelope', async () => {
+  it('passes rpc frames to the legacy invoker and relays the envelope', async () => {
     const h = await startBridge()
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
@@ -201,29 +240,33 @@ describe('BridgeServer', () => {
     await waitFor(() => frames.some((f) => f.t === 'rpc.result'))
     const result = frames.find((f) => f.t === 'rpc.result')
     expect(result).toMatchObject({ t: 'rpc.result', id: 'rpc-1', ok: true })
-    expect(h.fetchMock).toHaveBeenCalledTimes(1)
-    const request = h.fetchMock.mock.calls[0]![0] as Request
-    expect(request.url).toBe('http://dsh.internal/api/session.list')
-    expect(request.method).toBe('POST')
-    expect(request.headers.get('content-type')).toBe('application/json')
-    expect(JSON.parse(await request.text())).toEqual({ type: 'client-request', rpcId: 'rpc-1', method: 'session.list', payload: {} })
+    expect(h.invokeRpc).toHaveBeenCalledTimes(1)
+    expect(h.invokeRpc.mock.calls[0]![0]).toBe('session.list')
+    expect(h.invokeRpc.mock.calls[0]![1]).toEqual({})
+    expect(result).toMatchObject({
+      t: 'rpc.result',
+      id: 'rpc-1',
+      ok: true,
+      result: { type: 'server-response', rpcId: 'rpc-1', result: { ok: true, value: 'ok' } },
+    })
     ws.close()
   })
 
-  it('reports gateway failures as rpc.result errors', async () => {
-    const h = await startBridge({ apiHandler: { fetch: async () => new Response('handler failure: boom', { status: 500 }) } })
+  it('reports invoker throws as rpc.result errors', async () => {
+    const h = await startBridge()
     harnesses.push(h)
+    h.invokeRpc.mockRejectedValueOnce(new Error('boom'))
     const { ws, frames } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: { textOnly: true, snapshotMaxChars: 12000, maxInteractiveItems: 60 } })
     await waitFor(() => frames.some((f) => f.t === 'hello.ok'))
     send(ws, { t: 'rpc', id: 'rpc-2', method: 'session.list', payload: {} })
     await waitFor(() => frames.some((f) => f.t === 'rpc.result' && f.id === 'rpc-2'))
     expect(frames.find((f) => f.t === 'rpc.result' && f.id === 'rpc-2'))
-      .toMatchObject({ t: 'rpc.result', id: 'rpc-2', ok: false, error: { code: 'http' } })
+      .toMatchObject({ t: 'rpc.result', id: 'rpc-2', ok: false, error: { code: 'internal', message: 'Error: boom' } })
     ws.close()
   })
 
-  it('injects followed-page snapshots without forwarding the internal RPC to the gateway', async () => {
+  it('injects followed-page snapshots without forwarding the internal RPC to the invoker', async () => {
     const injectBrowserSnapshot = vi.fn()
     const h = await startBridge({ injectBrowserSnapshot })
     harnesses.push(h)
@@ -240,7 +283,7 @@ describe('BridgeServer', () => {
     await waitFor(() => frames.some((frame) => frame.t === 'rpc.result' && frame.id === 'snapshot-1'))
 
     expect(injectBrowserSnapshot).toHaveBeenCalledWith('session-1', 'Page: Other target')
-    expect(h.fetchMock).not.toHaveBeenCalled()
+    expect(h.invokeRpc).not.toHaveBeenCalled()
     expect(frames).toContainEqual({
       t: 'rpc.result', id: 'snapshot-1', ok: true, result: { accepted: true },
     })
@@ -258,7 +301,7 @@ describe('BridgeServer', () => {
     ws.close()
   })
 
-  it('purges sessions through the internal RPC without forwarding it to the gateway', async () => {
+  it('purges sessions through the internal RPC without forwarding it to the invoker', async () => {
     const purgeSession = vi.fn(async () => {})
     const h = await startBridge({ purgeSession })
     harnesses.push(h)
@@ -275,7 +318,7 @@ describe('BridgeServer', () => {
     await waitFor(() => frames.some((frame) => frame.t === 'rpc.result' && frame.id === 'purge-1'))
 
     expect(purgeSession).toHaveBeenCalledWith('session-82222a77-aab5-4c0b-b33e-6376973ec93d')
-    expect(h.fetchMock).not.toHaveBeenCalled()
+    expect(h.invokeRpc).not.toHaveBeenCalled()
     expect(frames).toContainEqual({
       t: 'rpc.result', id: 'purge-1', ok: true, result: { purged: true },
     })
@@ -331,9 +374,9 @@ describe('BridgeServer', () => {
     })
 
     await waitFor(() => injectBrowserSnapshot.mock.calls.length === 1)
-    expect(h.fetchMock).not.toHaveBeenCalled()
+    expect(h.invokeRpc).not.toHaveBeenCalled()
     releaseInjection()
-    await waitFor(() => h.fetchMock.mock.calls.length === 1)
+    await waitFor(() => h.invokeRpc.mock.calls.length === 1)
     await waitFor(() => frames.some((frame) => frame.t === 'rpc.result' && frame.id === 'prompt-after-snapshot'))
     expect(frames.filter((frame) => frame.t === 'rpc.result').map((frame) => frame.id)).toEqual([
       'snapshot',
@@ -346,17 +389,13 @@ describe('BridgeServer', () => {
     let releasePrompt!: () => void
     const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve })
     const calls: Array<{ method: string; sessionId: string }> = []
-    const apiHandler = { fetch: vi.fn(async (request: Request) => {
-      const body = await request.json() as { rpcId: string; method: string; payload: { sessionId: string } }
-      calls.push({ method: body.method, sessionId: body.payload.sessionId })
-      if (body.method === 'session.prompt' && body.payload.sessionId === 'provisional') await promptGate
-      return Response.json({
-        type: 'server-response',
-        rpcId: body.rpcId,
-        result: { ok: true, value: { accepted: true } },
-      })
-    }) }
-    const h = await startBridge({ apiHandler })
+    const invokeRpc = vi.fn(async (method: string, payload: unknown): Promise<LegacyResult> => {
+      const { sessionId } = payload as { sessionId: string }
+      calls.push({ method, sessionId })
+      if (method === 'session.prompt' && sessionId === 'provisional') await promptGate
+      return { ok: true, value: { accepted: true } }
+    })
+    const h = await startBridge({ invokeRpc })
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
@@ -384,12 +423,26 @@ describe('BridgeServer', () => {
     ws.close()
   })
 
-  it('relays interaction responses to /api/respond with the original rpcId', async () => {
-    const h = await startBridge()
+  it('answers pending waterfalls through the Typert $events/result carrier', async () => {
+    const gateway = fakeGateway({
+      '$events': async function* () {
+        yield { type: 'ready', clientId: 'client-1' }
+        yield {
+          type: 'waterfall',
+          event: 'user-questions/request',
+          eventId: 'question-1',
+          agentId: 'session-1',
+          request: { questions: [{ id: 'db', question: 'SQLite or Mongo?' }] },
+        }
+      },
+    })
+    const h = await startBridge({ gateway })
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
     await waitFor(() => frames.some((frame) => frame.t === 'hello.ok'))
+    await waitFor(() => frames.some((frame) => frame.t === 'event' && frame.frame.method === 'question/requested'))
+
     send(ws, {
       t: 'respond',
       id: 'response-1',
@@ -398,35 +451,81 @@ describe('BridgeServer', () => {
     })
     await waitFor(() => frames.some((frame) => frame.t === 'respond.result'))
 
-    expect(frames).toContainEqual(expect.objectContaining({
-      t: 'respond.result', id: 'response-1', ok: true,
-    }))
-    const request = h.fetchMock.mock.calls[0]![0] as Request
-    expect(request.url).toBe('http://dsh.internal/api/respond')
-    expect(request.method).toBe('POST')
-    expect(request.headers.get('content-type')).toBe('application/json')
-    expect(JSON.parse(await request.text())).toEqual({
-      type: 'client-response',
-      rpcId: 'question-1',
-      result: { ok: true, value: { sessionId: 'session-1', answer: { answers: [{ id: 'db', selected: ['SQLite'] }] } } },
+    expect(frames).toContainEqual({
+      t: 'respond.result', id: 'response-1', ok: true, result: { accepted: true },
+    })
+    expect(gateway.dispatchRpc).toHaveBeenCalledWith('$events/result', {
+      args: {
+        clientId: 'client-1',
+        eventId: 'question-1',
+        outcome: { kind: 'result', value: { answers: [{ id: 'db', selected: ['SQLite'] }] } },
+      },
     })
     ws.close()
   })
 
-  it('returns gateway response failures to the extension', async () => {
-    const h = await startBridge({ apiHandler: { fetch: async () => new Response('response rejected', { status: 409 }) } })
+  it('translates dismissed questions into ASK_CANCELLED rejections', async () => {
+    const gateway = fakeGateway({
+      '$events': async function* () {
+        yield { type: 'ready', clientId: 'client-2' }
+        yield {
+          type: 'waterfall',
+          event: 'user-questions/request',
+          eventId: 'question-2',
+          agentId: 'session-2',
+          request: { questions: [{ id: 'q', question: 'Pick one' }] },
+        }
+      },
+    })
+    const h = await startBridge({ gateway })
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
     await waitFor(() => frames.some((frame) => frame.t === 'hello.ok'))
+    await waitFor(() => frames.some((frame) => frame.t === 'event' && frame.frame.method === 'question/requested'))
+
     send(ws, {
       t: 'respond', id: 'response-2', rpcId: 'question-2',
       result: { ok: false, error: { code: 'cancelled', message: 'user dismissed the question', details: {} } },
     })
     await waitFor(() => frames.some((frame) => frame.t === 'respond.result' && frame.id === 'response-2'))
+    expect(gateway.dispatchRpc).toHaveBeenCalledWith('$events/result', {
+      args: {
+        clientId: 'client-2',
+        eventId: 'question-2',
+        outcome: {
+          kind: 'rejected',
+          error: { name: 'UserQuestionError', message: 'user dismissed the question', code: 'ASK_CANCELLED' },
+        },
+      },
+    })
+
+    // Unknown error codes keep the old bad-response refusal.
+    send(ws, {
+      t: 'respond', id: 'response-3', rpcId: 'question-2',
+      result: { ok: false, error: { code: 'bogus', message: 'nope', details: {} } },
+    })
+    await waitFor(() => frames.some((frame) => frame.t === 'respond.result' && frame.id === 'response-3'))
     expect(frames).toContainEqual({
-      t: 'respond.result', id: 'response-2', ok: false,
-      error: { code: 'http', message: 'response rejected' },
+      t: 'respond.result', id: 'response-3', ok: true, result: { accepted: false, reason: 'bad-response' },
+    })
+    ws.close()
+  })
+
+  it('reports not-pending answers for unknown waterfalls', async () => {
+    const gateway = fakeGateway({ '$events': async function* () { yield { type: 'ready', clientId: 'c' } } })
+    const h = await startBridge({ gateway })
+    harnesses.push(h)
+    const { ws, frames } = await connect(h.url)
+    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
+    await waitFor(() => frames.some((frame) => frame.t === 'hello.ok'))
+    send(ws, {
+      t: 'respond', id: 'response-4', rpcId: 'unknown',
+      result: { ok: true, value: { sessionId: 's', answer: { answers: [] } } },
+    })
+    await waitFor(() => frames.some((frame) => frame.t === 'respond.result' && frame.id === 'response-4'))
+    expect(frames).toContainEqual({
+      t: 'respond.result', id: 'response-4', ok: true, result: { accepted: false, reason: 'not-pending' },
     })
     ws.close()
   })
@@ -565,14 +664,35 @@ describe('BridgeServer', () => {
     ws.close()
   })
 
-  it('pumps event frames to the connected extension', async () => {
-    const h = await startBridge()
+  it('pumps waterfall and question frames to the connected extension', async () => {
+    const gateway = fakeGateway({
+      '$events': async function* () {
+        yield { type: 'ready', clientId: 'client-3' }
+        yield {
+          type: 'waterfall',
+          event: 'user-questions/request',
+          eventId: 'e1',
+          agentId: 's1',
+          request: { questions: [{ id: 'q', question: 'Pick one' }] },
+        }
+        yield { type: 'cancel', eventId: 'e1' }
+      },
+    })
+    const h = await startBridge({ gateway })
     harnesses.push(h)
     const { ws, frames } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: { textOnly: true, snapshotMaxChars: 12000, maxInteractiveItems: 60 } })
     await waitFor(() => frames.filter((f) => f.t === 'event').length >= 2)
     const events = frames.filter((f) => f.t === 'event') as Extract<BridgeFrame, { t: 'event' }>[]
-    expect(events.map((e) => e.frame.method)).toEqual(['session/subscribed', 'session/queue'])
+    expect(events.map((e) => e.frame.method)).toEqual(['question/requested', 'question/resolved'])
+    expect(events[0]!.frame).toMatchObject({
+      rpcId: 'e1',
+      payload: { sessionId: 's1', questions: [{ id: 'q', question: 'Pick one' }] },
+    })
+    expect(events[1]!.frame).toMatchObject({
+      rpcId: 'e1',
+      payload: { sessionId: 's1', questionRpcId: 'e1' },
+    })
     ws.close()
   })
 
@@ -607,24 +727,49 @@ describe('BridgeServer', () => {
     ws.close()
   })
 
-  it('stops the stream-failed arm when the pump fails after the socket closed', async () => {
-    const lateFailEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
-      async *[Symbol.asyncIterator]() {
-        yield { rpcId: RpcId('l1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
-        await new Promise((resolve) => { setTimeout(resolve, 120) })
-        throw new Error('late failure')
+  it('emits a stream-failed error frame when the $events stream throws', async () => {
+    const gateway = fakeGateway({
+      '$events': async function* () {
+        yield { type: 'ready', clientId: 'c' }
+        throw new Error('stream broke')
       },
-    }
-    const h = await startBridge({ openEvents: () => lateFailEvents })
+    })
+    const h = await startBridge({ gateway })
+    harnesses.push(h)
+    const { ws, frames } = await connect(h.url)
+    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
+    await waitFor(() => frames.some((f) => f.t === 'error' && f.code === 'stream-failed'))
+    expect(frames.find((f) => f.t === 'error')).toMatchObject({ t: 'error', code: 'stream-failed' })
+    ws.close()
+  })
+
+  it('stops pumping events once the socket closes mid-stream', async () => {
+    const gateway = fakeGateway({
+      '$events': async function* () {
+        yield { type: 'ready', clientId: 'c' }
+        for (let i = 0; i < 100; i += 1) {
+          yield {
+            type: 'waterfall',
+            event: 'user-questions/request',
+            eventId: `q${i}`,
+            agentId: 's1',
+            request: { questions: [{ id: `q${i}`, question: 'Pick one' }] },
+          }
+          await new Promise((resolve) => { setTimeout(resolve, 10) })
+        }
+      },
+    })
+    const h = await startBridge({ gateway })
     harnesses.push(h)
     const { ws, frames, done } = await connect(h.url)
     send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
-    await waitFor(() => frames.some((f) => f.t === 'hello.ok'))
+    await waitFor(() => frames.filter((f) => f.t === 'event').length >= 2)
     ws.close()
     await done
-    // The pump fails after the close: the abort flag suppresses the error frame.
-    await new Promise((resolve) => { setTimeout(resolve, 200) })
-    expect(frames.some((f) => f.t === 'error')).toBe(false)
+    // The pump must stop sending after close instead of writing to a dead socket.
+    const countBefore = frames.filter((f) => f.t === 'event').length
+    await new Promise((resolve) => { setTimeout(resolve, 80) })
+    expect(frames.filter((f) => f.t === 'event').length).toBe(countBefore)
   })
 
   it('closes cleanly and rejects pending work', async () => {
@@ -673,34 +818,6 @@ describe('BridgeServer', () => {
     expect(ws.readyState).toBe(WebSocket.CLOSED)
   })
 
-  it('reports non-JSON 200 bodies and fetch throws as rpc.result errors', async () => {
-    const h = await startBridge({
-      apiHandler: { fetch: async () => new Response('plain text body', { status: 200 }) },
-    })
-    harnesses.push(h)
-    const { ws, frames } = await connect(h.url)
-    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
-    await waitFor(() => frames.some((f) => f.t === 'hello.ok'))
-    send(ws, { t: 'rpc', id: 'rpc-3', method: 'session.list', payload: {} })
-    await waitFor(() => frames.some((f) => f.t === 'rpc.result' && f.id === 'rpc-3'))
-    const nonJson = frames.find((f) => f.t === 'rpc.result' && f.id === 'rpc-3')!
-    expect(nonJson).toMatchObject({ t: 'rpc.result', id: 'rpc-3', ok: true, result: 'plain text body' })
-    ws.close()
-
-    const throwing = await startBridge({
-      apiHandler: { fetch: async () => { throw new Error('boom') } },
-    })
-    harnesses.push(throwing)
-    const second = await connect(throwing.url)
-    send(second.ws, { t: 'hello', token: TOKEN, caps: CAPS })
-    await waitFor(() => second.frames.some((f) => f.t === 'hello.ok'))
-    send(second.ws, { t: 'rpc', id: 'rpc-4', method: 'session.list', payload: {} })
-    await waitFor(() => second.frames.some((f) => f.t === 'rpc.result' && f.id === 'rpc-4'))
-    expect(second.frames.find((f) => f.t === 'rpc.result' && f.id === 'rpc-4'))
-      .toMatchObject({ t: 'rpc.result', id: 'rpc-4', ok: false, error: { code: 'internal', message: 'Error: boom' } })
-    second.ws.close()
-  })
-
   it('ignores tool results with unknown ids', async () => {
     const h = await startBridge()
     harnesses.push(h)
@@ -732,43 +849,5 @@ describe('BridgeServer', () => {
     const allowed = frames.find((f): f is Extract<BridgeFrame, { t: 'rpc.result' }> => f.t === 'rpc.result' && f.id === 'priv-2')!
     expect(allowed.ok).toBe(true)
     ws.close()
-  })
-
-  it('emits a stream-failed error frame when the event stream throws', async () => {
-    const failingEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
-      async *[Symbol.asyncIterator]() {
-        yield { rpcId: RpcId('f1'), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: 0 } }
-        throw new Error('stream broke')
-      },
-    }
-    const h = await startBridge({ openEvents: () => failingEvents })
-    harnesses.push(h)
-    const { ws, frames } = await connect(h.url)
-    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
-    await waitFor(() => frames.some((f) => f.t === 'error' && f.code === 'stream-failed'))
-    expect(frames.find((f) => f.t === 'error')).toMatchObject({ t: 'error', code: 'stream-failed' })
-    ws.close()
-  })
-
-  it('stops pumping events once the socket closes mid-stream', async () => {
-    const slowEvents: AsyncIterable<RpcRequest<MuxFrame>> = {
-      async *[Symbol.asyncIterator]() {
-        for (let i = 0; i < 100; i += 1) {
-          yield { rpcId: RpcId(`s${i}`), payload: { type: 'session/subscribed', sessionId: 's1' as never, lastSeq: i } }
-          await new Promise((resolve) => { setTimeout(resolve, 10) })
-        }
-      },
-    }
-    const h = await startBridge({ openEvents: () => slowEvents })
-    harnesses.push(h)
-    const { ws, frames, done } = await connect(h.url)
-    send(ws, { t: 'hello', token: TOKEN, caps: CAPS })
-    await waitFor(() => frames.filter((f) => f.t === 'event').length >= 2)
-    ws.close()
-    await done
-    // The pump must stop sending after close instead of writing to a dead socket.
-    const countBefore = frames.filter((f) => f.t === 'event').length
-    await new Promise((resolve) => { setTimeout(resolve, 80) })
-    expect(frames.filter((f) => f.t === 'event').length).toBe(countBefore)
   })
 })
